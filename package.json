@@ -12,13 +12,5 @@
   },
   "engines": {
     "node": "18.x"
-  },
-  "keywords": [
-    "trading",
-    "binance",
-    "smc",
-    "paper-trading"
-  ],
-  "author": "sanches6969",
-  "license": "MIT"
+  }
 }
