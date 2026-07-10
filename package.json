@@ -1,18 +1,24 @@
-# Секрет для защиты эндпоинта /api/scan от чужих вызовов.
-# Сгенерируй любую длинную случайную строку (например через 1Password / openssl rand -hex 32)
-CRON_SECRET=придумай_длинную_случайную_строку
-
-# Торговый инструмент и таймфрейм (Binance-формат: 1m, 5m, 15m, 1h, 4h, 1d ...)
-SYMBOL=BTCUSDT
-INTERVAL=15m
-
-# Виртуальный баланс и риск на сделку
-INITIAL_BALANCE=1000
-RISK_PCT=1
-
-# Google Sheets — сервисный аккаунт (см. README, раздел "Настройка Google Sheets")
-GOOGLE_SHEET_ID=айди_таблицы_из_ссылки
-GOOGLE_SERVICE_ACCOUNT_EMAIL=xxx@xxx.iam.gserviceaccount.com
-# Приватный ключ вставляется ЦЕЛИКОМ, включая -----BEGIN PRIVATE KEY----- / END,
-# переносы строк можно оставить как \n (код сам их раскодирует)
-GOOGLE_PRIVATE_KEY="-----BEGIN PRIVATE KEY-----\nMIIEv...\n-----END PRIVATE KEY-----\n"
+{
+  "name": "smc-paper-trading-bot",
+  "version": "1.0.0",
+  "description": "SMC Paper Trading Bot with Binance and Google Sheets",
+  "main": "scan.js",
+  "scripts": {
+    "start": "node scan.js"
+  },
+  "dependencies": {
+    "@googleapis/sheets": "^5.0.5",
+    "node-fetch": "^2.6.7"
+  },
+  "engines": {
+    "node": "18.x"
+  },
+  "keywords": [
+    "trading",
+    "binance",
+    "smc",
+    "paper-trading"
+  ],
+  "author": "sanches6969",
+  "license": "MIT"
+}
