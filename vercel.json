@@ -1,7 +1,0 @@
-{
-  "functions": {
-    "api/scan.js": {
-      "runtime": "nodejs@24.x"
-    }
-  }
-}
