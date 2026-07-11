@@ -1,16 +1,9 @@
 {
   "name": "smc-paper-trading-bot",
   "version": "1.0.0",
-  "description": "SMC Paper Trading Bot with Binance and Google Sheets",
-  "main": "scan.js",
-  "scripts": {
-    "start": "node scan.js"
-  },
+  "private": true,
+  "engines": { "node": ">=18" },
   "dependencies": {
-    "@googleapis/sheets": "^5.0.5",
-    "node-fetch": "^2.6.7"
-  },
-  "engines": {
-    "node": "24.x"
+    "googleapis": "^140.0.0"
   }
 }
