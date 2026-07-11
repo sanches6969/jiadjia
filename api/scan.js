@@ -1,13 +1,14 @@
-const { getKlines, getCurrentPrice } = require('../lib/binance');
-const { findEntrySignal, checkPosition } = require('../lib/strategy');
-const sheets = require('../lib/sheets');
+const { getKlines, getCurrentPrice } = require("../lib/binance");
+const { findEntrySignal, checkPosition } = require("../lib/strategy");
+const sheets = require("../lib/sheets");
 
 const SYMBOL = process.env.SYMBOL || "BTCUSDT";
 const INTERVAL = process.env.INTERVAL || "15m";
-const RISK_PCT = parseFloat(process.env.RISK_PCT || "1");
+const RISK_PCT = parseFloat(process.env.RISK_PCT || "1"); // % от баланса на сделку
 const DEFAULT_BALANCE = parseFloat(process.env.INITIAL_BALANCE || "1000");
 
 module.exports = async (req, res) => {
+  // защита от случайных чужих вызовов эндпоинта
   const secret = req.query.secret || (req.headers.authorization || "").replace("Bearer ", "");
   if (secret !== process.env.CRON_SECRET) {
     res.status(401).json({ error: "unauthorized" });
@@ -19,10 +20,11 @@ module.exports = async (req, res) => {
     const state = await sheets.getState();
 
     if (state && state.symbol === SYMBOL) {
+      // --- есть открытая позиция: проверяем стоп / частичный / финальный тейк ---
       const result = checkPosition(state, currentPrice);
 
       if (result.action === "partial") {
-        const closedQty = state.qty * 0.2;
+        const closedQty = state.qty * 0.2; // EXIT_SCHEME.partialPct (20%) — фиксировано в strategy.js
         const pnlPart = state.direction === "long"
           ? (result.exitPrice - state.entry) * closedQty
           : (state.entry - result.exitPrice) * closedQty;
@@ -35,7 +37,7 @@ module.exports = async (req, res) => {
           ...state,
           sl: result.newSl,
           partialTaken: true,
-          qty: state.qty - closedQty,
+          qty: state.qty - closedQty, // оставшийся объем едет дальше к финальному тейку
         });
 
         res.status(200).json({ status: "partial_tp", price: currentPrice, pnlPart });
@@ -62,6 +64,7 @@ module.exports = async (req, res) => {
       return;
     }
 
+    // --- позиции нет: ищем новый сетап на вход ---
     const klines = await getKlines(SYMBOL, INTERVAL, 200);
     const signal = findEntrySignal(klines, currentPrice);
 
