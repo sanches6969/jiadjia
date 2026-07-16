@@ -1,5 +1,5 @@
 const { getKlines, getCurrentPrice } = require("../lib/binance");
-const { findEntrySignal, checkPosition } = require("../lib/strategy");
+const { findEntrySignal, checkPosition, EXIT_SCHEME } = require("../lib/strategy");
 const sheets = require("../lib/sheets");
 
 const SYMBOL = process.env.SYMBOL || "BTCUSDT";
@@ -24,7 +24,7 @@ module.exports = async (req, res) => {
       const result = checkPosition(state, currentPrice);
 
       if (result.action === "partial") {
-        const closedQty = state.qty * 0.2; // EXIT_SCHEME.partialPct (20%) — фиксировано в strategy.js
+        const closedQty = state.qty * EXIT_SCHEME.partialPct;
         const pnlPart = state.direction === "long"
           ? (result.exitPrice - state.entry) * closedQty
           : (state.entry - result.exitPrice) * closedQty;
