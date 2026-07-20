@@ -6,6 +6,10 @@ const SYMBOL = process.env.SYMBOL || "BTCUSDT";
 const INTERVAL = process.env.INTERVAL || "15m";
 const RISK_PCT = parseFloat(process.env.RISK_PCT || "1"); // % от баланса на сделку
 const DEFAULT_BALANCE = parseFloat(process.env.INITIAL_BALANCE || "1000");
+const KLINES_LIMIT = parseInt(process.env.KLINES_LIMIT || "500", 10);
+// после закрытия любой сделки не открывать новую это же кол-во минут —
+// защита от мгновенного повторного входа в ту же только что убыточную зону
+const COOLDOWN_MINUTES = parseFloat(process.env.COOLDOWN_MINUTES || "60");
 
 module.exports = async (req, res) => {
   // защита от случайных чужих вызовов эндпоинта
@@ -55,6 +59,7 @@ module.exports = async (req, res) => {
         });
         const newBalance = await sheets.updateSummary(pnl);
         await sheets.clearState();
+        await sheets.setCooldownUntil(new Date(Date.now() + COOLDOWN_MINUTES * 60 * 1000));
 
         res.status(200).json({ status: "closed", exitReason: result.exitReason, pnl, newBalance });
         return;
@@ -64,8 +69,18 @@ module.exports = async (req, res) => {
       return;
     }
 
-    // --- позиции нет: ищем новый сетап на вход ---
-    const klines = await getKlines(SYMBOL, INTERVAL, 200);
+    // --- позиции нет: сначала проверяем, не остываем ли мы после недавнего закрытия ---
+    const cooldownUntil = await sheets.getCooldownUntil();
+    if (cooldownUntil && cooldownUntil > new Date()) {
+      res.status(200).json({
+        status: "cooldown", price: currentPrice,
+        cooldown_until: cooldownUntil.toISOString(),
+      });
+      return;
+    }
+
+    // --- ищем новый сетап на вход ---
+    const klines = await getKlines(SYMBOL, INTERVAL, KLINES_LIMIT);
     const signal = findEntrySignal(klines, currentPrice);
 
     if (!signal) {
