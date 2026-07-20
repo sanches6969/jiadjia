@@ -1,10 +1,7 @@
 {
   "functions": {
-    "api/index.py": {
-      "maxDuration": 60
+    "api/**/*.js": {
+      "regions": ["fra1"]
     }
-  },
-  "rewrites": [
-    { "source": "/api/(.*)", "destination": "/api/index" }
-  ]
+  }
 }
