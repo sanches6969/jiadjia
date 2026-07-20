@@ -1,7 +1,7 @@
 import requests
 import pandas as pd
 
-BINANCE_BASE = "https://data-api.binance.com"
+BINANCE_BASE = "https://data-api.binance.vision"
 
 
 def get_klines(symbol: str, interval: str, limit: int = 500) -> pd.DataFrame:
