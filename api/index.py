@@ -14,7 +14,6 @@ MAX_LEVERAGE = float(os.environ.get("MAX_LEVERAGE", "10"))
 DEFAULT_BALANCE = float(os.environ.get("INITIAL_BALANCE", "1000"))
 KLINES_LIMIT = int(os.environ.get("KLINES_LIMIT", "500"))
 ENTRY_LOOKBACK_BARS = int(os.environ.get("ENTRY_LOOKBACK_BARS", "50"))
-COOLDOWN_MINUTES = float(os.environ.get("COOLDOWN_MINUTES", "60"))
 
 # ==============================================================================
 # 4 независимые конфигурации, отобранные по итогам RR-sweep на ETHUSDT/30 дней.
@@ -25,29 +24,55 @@ COOLDOWN_MINUTES = float(os.environ.get("COOLDOWN_MINUTES", "60"))
 #
 #   fixed_tp_r=None + partial_r=None -> "no_partial": просто один финальный
 #     выход на fixed_tp_r без частичных тейков (cfg.USE_PARTIAL_TP=False)
+#
+#   cooldown_bars: пауза после закрытия сделки, заданная В БАРАХ этого джоба,
+#     а не в абсолютных минутах. Так пауза автоматически масштабируется под
+#     таймфрейм — на 1m она не растягивается на час, а на 15m не сгорает
+#     за 4 бара (что раньше давало риск повторного входа в ту же зону).
 # ==============================================================================
 JOBS = [
     {
         "id": "FVG_REBALANCE_5m", "strategy": "FVG_REBALANCE",
         "interval": "5m", "htf_interval": "1h",
         "fixed_tp_r": 4.0, "partial_r": None, "partial_pct": 0.0,  # fixed_4R_no_partial
+        "cooldown_bars": 12,   # 12 * 5m = 60 мин
     },
     {
         "id": "QUASIMODO_POI_5m", "strategy": "QUASIMODO_POI",
         "interval": "5m", "htf_interval": "1h",
         "fixed_tp_r": 3.0, "partial_r": 1.0, "partial_pct": 0.5,  # fixed_3R_partial_50@1R
+        "cooldown_bars": 12,   # 12 * 5m = 60 мин
     },
     {
         "id": "FVG_REBALANCE_1m", "strategy": "FVG_REBALANCE",
         "interval": "1m", "htf_interval": "15m",
         "fixed_tp_r": 4.0, "partial_r": None, "partial_pct": 0.0,  # fixed_4R_no_partial
+        "cooldown_bars": 15,   # 15 * 1m = 15 мин (было бы 60 мин при старом фикс.-минутном кулдауне)
     },
     {
         "id": "QUASIMODO_POI_15m", "strategy": "QUASIMODO_POI",
         "interval": "15m", "htf_interval": "4h",
         "fixed_tp_r": 2.0, "partial_r": 1.0, "partial_pct": 0.5,  # fixed_2R_partial_50@1R
+        "cooldown_bars": 10,   # 10 * 15m = 150 мин (было бы всего 4 бара при старом фикс.-минутном кулдауне)
     },
 ]
+
+
+def interval_to_minutes(interval: str) -> float:
+    """Переводит строку таймфрейма ('1m','5m','15m','1h','4h','1d') в минуты."""
+    unit = interval[-1]
+    value = float(interval[:-1])
+    if unit == "m":
+        return value
+    if unit == "h":
+        return value * 60
+    if unit == "d":
+        return value * 1440
+    raise ValueError(f"Неизвестный формат интервала: {interval}")
+
+
+def cooldown_minutes_for(job: dict) -> float:
+    return job["cooldown_bars"] * interval_to_minutes(job["interval"])
 
 
 def build_base_cfg():
@@ -189,7 +214,10 @@ def scan():
                     sh.update_trade_close(state["trade_row"], result["exit_price"], pnl, pnl_pct, result["reason"])
                     new_balance = sh.update_summary(pnl)
                     sh.clear_state(job_id)
-                    sh.set_cooldown_until(job_id, datetime.now(timezone.utc) + timedelta(minutes=COOLDOWN_MINUTES))
+                    sh.set_cooldown_until(
+                        job_id,
+                        datetime.now(timezone.utc) + timedelta(minutes=cooldown_minutes_for(job))
+                    )
                     results[job_id] = {"status": "closed", "reason": result["reason"], "pnl": round(pnl, 2), "balance": round(new_balance, 2)}
                     continue
 
