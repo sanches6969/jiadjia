@@ -1,5 +1,6 @@
 import requests
 import pandas as pd
+from datetime import datetime, timezone
 
 # Несколько зеркал Binance на случай, если конкретный исполняющий IP
 # серверлесс-функции попал под гео/юридическую блокировку (HTTP 451) на
@@ -48,3 +49,21 @@ def get_klines(symbol: str, interval: str, limit: int = 500) -> pd.DataFrame:
 def get_current_price(symbol: str) -> float:
     data = _get_with_fallback("/api/v3/ticker/price", {"symbol": symbol})
     return float(data["price"])
+
+
+def get_recent_bars_since(symbol: str, since_iso, max_limit: int = 1000) -> pd.DataFrame:
+    """1m-свечи с момента последней проверки (since_iso) до сейчас (+ немного
+    запаса). Нужно, чтобы ловить внутрисвечные касания SL/TP, которые
+    происходят МЕЖДУ опросами крона (cron-job.org дергает /api/scan раз в
+    1-5 минут) — раньше бот сравнивал SL/TP только с мгновенной ценой в
+    момент опроса и пропускал пробития, если цена успевала отскочить назад
+    до следующего тика."""
+    if since_iso:
+        since_dt = datetime.fromisoformat(str(since_iso).replace("Z", "+00:00"))
+        minutes_elapsed = (datetime.now(timezone.utc) - since_dt).total_seconds() / 60.0
+        limit = min(max(int(minutes_elapsed) + 3, 3), max_limit)
+    else:
+        # нет метки последней проверки (старое состояние без этого поля, либо
+        # первая проверка сразу после открытия) — подстраховываемся часом назад
+        limit = 60
+    return get_klines(symbol, "1m", limit)
