@@ -14,6 +14,7 @@ MAX_LEVERAGE = float(os.environ.get("MAX_LEVERAGE", "10"))
 DEFAULT_BALANCE = float(os.environ.get("INITIAL_BALANCE", "1000"))
 KLINES_LIMIT = int(os.environ.get("KLINES_LIMIT", "500"))
 ENTRY_LOOKBACK_BARS = int(os.environ.get("ENTRY_LOOKBACK_BARS", "50"))
+COOLDOWN_MINUTES = float(os.environ.get("COOLDOWN_MINUTES", "60"))
 
 # ==============================================================================
 # 4 независимые конфигурации, отобранные по итогам RR-sweep на ETHUSDT/30 дней.
@@ -24,55 +25,29 @@ ENTRY_LOOKBACK_BARS = int(os.environ.get("ENTRY_LOOKBACK_BARS", "50"))
 #
 #   fixed_tp_r=None + partial_r=None -> "no_partial": просто один финальный
 #     выход на fixed_tp_r без частичных тейков (cfg.USE_PARTIAL_TP=False)
-#
-#   cooldown_bars: пауза после закрытия сделки, заданная В БАРАХ этого джоба,
-#     а не в абсолютных минутах. Так пауза автоматически масштабируется под
-#     таймфрейм — на 1m она не растягивается на час, а на 15m не сгорает
-#     за 4 бара (что раньше давало риск повторного входа в ту же зону).
 # ==============================================================================
 JOBS = [
     {
         "id": "FVG_REBALANCE_5m", "strategy": "FVG_REBALANCE",
         "interval": "5m", "htf_interval": "1h",
         "fixed_tp_r": 4.0, "partial_r": None, "partial_pct": 0.0,  # fixed_4R_no_partial
-        "cooldown_bars": 12,   # 12 * 5m = 60 мин
     },
     {
         "id": "QUASIMODO_POI_5m", "strategy": "QUASIMODO_POI",
         "interval": "5m", "htf_interval": "1h",
         "fixed_tp_r": 3.0, "partial_r": 1.0, "partial_pct": 0.5,  # fixed_3R_partial_50@1R
-        "cooldown_bars": 12,   # 12 * 5m = 60 мин
     },
     {
         "id": "FVG_REBALANCE_1m", "strategy": "FVG_REBALANCE",
         "interval": "1m", "htf_interval": "15m",
         "fixed_tp_r": 4.0, "partial_r": None, "partial_pct": 0.0,  # fixed_4R_no_partial
-        "cooldown_bars": 15,   # 15 * 1m = 15 мин (было бы 60 мин при старом фикс.-минутном кулдауне)
     },
     {
         "id": "QUASIMODO_POI_15m", "strategy": "QUASIMODO_POI",
         "interval": "15m", "htf_interval": "4h",
         "fixed_tp_r": 2.0, "partial_r": 1.0, "partial_pct": 0.5,  # fixed_2R_partial_50@1R
-        "cooldown_bars": 10,   # 10 * 15m = 150 мин (было бы всего 4 бара при старом фикс.-минутном кулдауне)
     },
 ]
-
-
-def interval_to_minutes(interval: str) -> float:
-    """Переводит строку таймфрейма ('1m','5m','15m','1h','4h','1d') в минуты."""
-    unit = interval[-1]
-    value = float(interval[:-1])
-    if unit == "m":
-        return value
-    if unit == "h":
-        return value * 60
-    if unit == "d":
-        return value * 1440
-    raise ValueError(f"Неизвестный формат интервала: {interval}")
-
-
-def cooldown_minutes_for(job: dict) -> float:
-    return job["cooldown_bars"] * interval_to_minutes(job["interval"])
 
 
 def build_base_cfg():
@@ -115,44 +90,76 @@ def liq_price_for(entry, direction, cfg):
     return entry * (1 - liq_dist_pct) if direction == "long" else entry * (1 + liq_dist_pct)
 
 
-def check_open_position(state: dict, current_price: float, cfg: ec.Config):
-    """Ликвидация -> стоп/БУ -> финальный TP -> частичный тейк (если задан)."""
+def evaluate_open_position_over_bars(state: dict, bars, cfg: ec.Config):
+    """Ликвидация -> стоп/БУ -> финальный TP -> частичный тейк — но проверяется
+    не по единственной мгновенной цене в момент опроса крона, а по High/Low
+    КАЖДОЙ 1m-свечи с момента последней проверки. Это критично: крон дергает
+    /api/scan раз в 1-5 минут, и если проверять только "текущую" цену на
+    момент вызова, можно пропустить внутрисвечной проброс за SL, если цена
+    успела отскочить обратно к следующему тику (сделка тогда "виснет" и
+    может закрыться по TP, хотя по факту SL уже был пробит).
+
+    Возвращает (events, working_state):
+      events — хронологический список сработавших событий:
+        {"action": "partial", ...} / {"action": "close", "exit_price", "reason", "bar_time"}
+      working_state — обновленное состояние (sl/qty/partials_taken), если
+        позиция не закрылась (events может быть пустым или содержать только
+        partial-события).
+    """
     direction = state["direction"]
     entry = state["entry"]
     risk = abs(entry - state["initial_sl"])
     sign = 1 if direction == "long" else -1
     is_long = direction == "long"
 
-    if state.get("liq_price") is not None:
-        hit_liq = (current_price <= state["liq_price"]) if is_long else (current_price >= state["liq_price"])
-        liq_closer = abs(state["liq_price"] - entry) <= abs(state["sl"] - entry)
-        if hit_liq and liq_closer:
-            return {"action": "close", "exit_price": state["liq_price"], "reason": "LIQUIDATION"}
+    working = dict(state)
+    events = []
 
-    hit_sl = (current_price <= state["sl"]) if is_long else (current_price >= state["sl"])
-    if hit_sl:
-        reason = "BE" if state["partials_taken"] > 0 else "SL"
-        return {"action": "close", "exit_price": state["sl"], "reason": reason}
+    for bar_time, row in bars.iterrows():
+        low, high = float(row["low"]), float(row["high"])
 
-    hit_tp = (current_price >= state["tp"]) if is_long else (current_price <= state["tp"])
-    if hit_tp:
-        return {"action": "close", "exit_price": state["tp"], "reason": "TP"}
+        if working.get("liq_price") is not None:
+            liq = working["liq_price"]
+            hit_liq = (low <= liq) if is_long else (high >= liq)
+            liq_closer = abs(liq - entry) <= abs(working["sl"] - entry)
+            if hit_liq and liq_closer:
+                events.append({"action": "close", "exit_price": liq, "reason": "LIQUIDATION", "bar_time": bar_time})
+                return events, working
 
-    levels = cfg.PARTIAL_TP_LEVELS
-    idx = state["partials_taken"]
-    if idx < len(levels) and risk > 0:
-        r, pct = levels[idx]
-        level_price = entry + sign * r * risk
-        hit_level = (current_price >= level_price) if is_long else (current_price <= level_price)
-        if hit_level:
-            close_qty = min(state["qty"] * pct, state["qty"])
-            return {
-                "action": "partial", "exit_price": level_price, "close_qty": close_qty,
-                "level_r": r, "new_partials_taken": idx + 1,
-                "move_be": cfg.MOVE_SL_TO_BE_AFTER_FIRST_TP and idx == 0,
-            }
+        hit_sl = (low <= working["sl"]) if is_long else (high >= working["sl"])
+        if hit_sl:
+            reason = "BE" if working["partials_taken"] > 0 else "SL"
+            events.append({"action": "close", "exit_price": working["sl"], "reason": reason, "bar_time": bar_time})
+            return events, working
 
-    return {"action": "none"}
+        hit_tp = (high >= working["tp"]) if is_long else (low <= working["tp"])
+        if hit_tp:
+            events.append({"action": "close", "exit_price": working["tp"], "reason": "TP", "bar_time": bar_time})
+            return events, working
+
+        levels = cfg.PARTIAL_TP_LEVELS
+        idx = working["partials_taken"]
+        if idx < len(levels) and risk > 0:
+            r, pct = levels[idx]
+            level_price = entry + sign * r * risk
+            hit_level = (high >= level_price) if is_long else (low <= level_price)
+            if hit_level:
+                close_qty = min(working["qty"] * pct, working["qty"])
+                events.append({
+                    "action": "partial", "exit_price": level_price, "close_qty": close_qty,
+                    "level_r": r, "new_partials_taken": idx + 1,
+                    "move_be": cfg.MOVE_SL_TO_BE_AFTER_FIRST_TP and idx == 0,
+                    "bar_time": bar_time,
+                })
+                working["qty"] = working["qty"] - close_qty
+                working["partials_taken"] = idx + 1
+                if cfg.MOVE_SL_TO_BE_AFTER_FIRST_TP and idx == 0:
+                    working["sl"] = entry
+                # частичный тейк не закрывает сделку — продолжаем проверять
+                # оставшиеся свечи этого же прохода (может успеть сработать
+                # и SL@BE, и финальный TP в пределах того же окна проверки)
+
+    return events, working
 
 
 def find_live_entry(setups, current_price: float, last_bar_index: int):
@@ -188,40 +195,41 @@ def scan():
             cfg = build_job_cfg(job, base_cfg)
 
             if state and state["symbol"] == SYMBOL:
-                result = check_open_position(state, current_price, cfg)
+                bars = bl.get_recent_bars_since(SYMBOL, state.get("last_checked"))
+                events, working = evaluate_open_position_over_bars(state, bars, cfg)
 
-                if result["action"] == "partial":
-                    pnl_part = (result["exit_price"] - state["entry"]) * result["close_qty"] if state["direction"] == "long" \
-                        else (state["entry"] - result["exit_price"]) * result["close_qty"]
-                    sign_str = "+" if pnl_part >= 0 else ""
-                    sh.append_partial_note(
-                        state["trade_row"],
-                        f"Частичный тейк {sign_str}{pnl_part:.2f}$ на {result['level_r']}R"
-                    )
-                    new_state = dict(state)
-                    new_state["qty"] = state["qty"] - result["close_qty"]
-                    new_state["partials_taken"] = result["new_partials_taken"]
-                    if result["move_be"]:
-                        new_state["sl"] = state["entry"]
-                    sh.set_state(job_id, new_state)
-                    results[job_id] = {"status": "partial_tp", "pnl_part": round(pnl_part, 2)}
-                    continue
+                closed = False
+                partial_pnls = []
+                for ev in events:
+                    if ev["action"] == "partial":
+                        pnl_part = (ev["exit_price"] - state["entry"]) * ev["close_qty"] if state["direction"] == "long" \
+                            else (state["entry"] - ev["exit_price"]) * ev["close_qty"]
+                        sign_str = "+" if pnl_part >= 0 else ""
+                        sh.append_partial_note(
+                            state["trade_row"],
+                            f"Частичный тейк {sign_str}{pnl_part:.2f}$ на {ev['level_r']}R"
+                        )
+                        partial_pnls.append(round(pnl_part, 2))
 
-                if result["action"] == "close":
-                    pnl = (result["exit_price"] - state["entry"]) * state["qty"] if state["direction"] == "long" \
-                        else (state["entry"] - result["exit_price"]) * state["qty"]
-                    pnl_pct = (pnl / (state["entry"] * state["qty"])) * 100 if state["qty"] else 0.0
-                    sh.update_trade_close(state["trade_row"], result["exit_price"], pnl, pnl_pct, result["reason"])
-                    new_balance = sh.update_summary(pnl)
-                    sh.clear_state(job_id)
-                    sh.set_cooldown_until(
-                        job_id,
-                        datetime.now(timezone.utc) + timedelta(minutes=cooldown_minutes_for(job))
-                    )
-                    results[job_id] = {"status": "closed", "reason": result["reason"], "pnl": round(pnl, 2), "balance": round(new_balance, 2)}
-                    continue
+                    elif ev["action"] == "close":
+                        pnl = (ev["exit_price"] - state["entry"]) * working["qty"] if state["direction"] == "long" \
+                            else (state["entry"] - ev["exit_price"]) * working["qty"]
+                        pnl_pct = (pnl / (state["entry"] * working["qty"])) * 100 if working["qty"] else 0.0
+                        sh.update_trade_close(state["trade_row"], ev["exit_price"], pnl, pnl_pct, ev["reason"])
+                        new_balance = sh.update_summary(pnl)
+                        sh.clear_state(job_id)
+                        sh.set_cooldown_until(job_id, datetime.now(timezone.utc) + timedelta(minutes=COOLDOWN_MINUTES))
+                        results[job_id] = {
+                            "status": "closed", "reason": ev["reason"], "pnl": round(pnl, 2),
+                            "balance": round(new_balance, 2), "partials": partial_pnls,
+                        }
+                        closed = True
+                        break
 
-                results[job_id] = {"status": "holding"}
+                if not closed:
+                    working["last_checked"] = datetime.now(timezone.utc).isoformat()
+                    sh.set_state(job_id, working)
+                    results[job_id] = {"status": "holding", "partials": partial_pnls} if partial_pnls else {"status": "holding"}
                 continue
 
             cooldown_until = sh.get_cooldown_until(job_id)
@@ -269,6 +277,7 @@ def scan():
                 "entry": setup.entry_ref_price, "initial_sl": setup.sl_price,
                 "sl": setup.sl_price, "tp": tp_price, "qty": qty,
                 "partials_taken": 0, "trade_row": trade_row, "liq_price": liq_price,
+                "last_checked": datetime.now(timezone.utc).isoformat(),
             })
             results[job_id] = {"status": "opened", "direction": setup.direction, "reason": setup.reason, "qty": round(qty, 6)}
 
