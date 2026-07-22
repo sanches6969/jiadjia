@@ -49,13 +49,13 @@ def get_all_states() -> dict:
     закрытой позиции, чтобы хранить cooldown, поэтому проверяем именно Symbol,
     а не сам факт наличия строки)."""
     svc = _client()
-    res = svc.spreadsheets().values().get(spreadsheetId=_sheet_id(), range="State!A2:L20", valueRenderOption="UNFORMATTED_VALUE").execute()
+    res = svc.spreadsheets().values().get(spreadsheetId=_sheet_id(), range="State!A2:M20", valueRenderOption="UNFORMATTED_VALUE").execute()
     rows = res.get("values", [])
     states = {}
     for row in rows:
         if not row or not row[0]:
             continue
-        row = row + [""] * (12 - len(row))
+        row = row + [""] * (13 - len(row))
         if not row[1]:  # Symbol пуст -> позиции нет, это просто якорь для cooldown
             continue
         states[row[0]] = {
@@ -65,6 +65,7 @@ def get_all_states() -> dict:
             "partials_taken": int(row[8] or 0),
             "trade_row": int(row[9]) if row[9] else None,
             "liq_price": float(row[10]) if row[10] not in ("", None) else None,
+            "last_checked": row[12] if row[12] not in ("", None) else None,
         }
     return states
 
@@ -91,21 +92,33 @@ def set_state(strategy: str, state: dict):
             spreadsheetId=_sheet_id(), range="State!A:K",
             valueInputOption="RAW", insertDataOption="INSERT_ROWS",
             body={"values": values}).execute()
+        row_idx = _find_state_row(svc, strategy)
     else:
         svc.spreadsheets().values().update(
             spreadsheetId=_sheet_id(), range=f"State!A{row_idx}:K{row_idx}",
             valueInputOption="RAW", body={"values": values}).execute()
+    # LastChecked (колонка M) пишем отдельным вызовом, НЕ трогая колонку L
+    # (там cooldown-метка, у нее свой независимый жизненный цикл — см.
+    # set_cooldown_until/get_cooldown_until).
+    if row_idx is not None:
+        last_checked = state.get("last_checked") or ""
+        svc.spreadsheets().values().update(
+            spreadsheetId=_sheet_id(), range=f"State!M{row_idx}",
+            valueInputOption="RAW", body={"values": [[last_checked]]}).execute()
 
 
 def clear_state(strategy: str):
-    """Очищает поля ОТКРЫТОЙ ПОЗИЦИИ (B:K), но оставляет саму строку (A=strategy)
-    на месте — она служит якорем для cooldown-метки в колонке L."""
+    """Очищает поля ОТКРЫТОЙ ПОЗИЦИИ (B:K, M), но оставляет саму строку (A=strategy)
+    и cooldown (L) на месте — L служит якорем для cooldown-метки."""
     svc = _client()
     row_idx = _find_state_row(svc, strategy)
     if row_idx is not None:
         svc.spreadsheets().values().update(
             spreadsheetId=_sheet_id(), range=f"State!B{row_idx}:K{row_idx}",
             valueInputOption="RAW", body={"values": [[""] * 10]}).execute()
+        svc.spreadsheets().values().update(
+            spreadsheetId=_sheet_id(), range=f"State!M{row_idx}",
+            valueInputOption="RAW", body={"values": [[""]]}).execute()
     else:
         # строки еще не было вообще — создаем пустую строку-якорь
         svc.spreadsheets().values().append(
