@@ -15,6 +15,10 @@ DEFAULT_BALANCE = float(os.environ.get("INITIAL_BALANCE", "1000"))
 KLINES_LIMIT = int(os.environ.get("KLINES_LIMIT", "500"))
 ENTRY_LOOKBACK_BARS = int(os.environ.get("ENTRY_LOOKBACK_BARS", "50"))
 COOLDOWN_MINUTES = float(os.environ.get("COOLDOWN_MINUTES", "60"))
+# отсекает сетапы с шумовым (слишком узким) стопом — частая проблема на 1m,
+# где гэп между свечами иногда получается почти нулевым; такие входы
+# статистически почти всегда сразу вылетают по стопу
+MIN_SL_DISTANCE_PCT = float(os.environ.get("MIN_SL_DISTANCE_PCT", "0.15"))
 
 # ==============================================================================
 # 4 независимые конфигурации, отобранные по итогам RR-sweep на ETHUSDT/30 дней.
@@ -90,76 +94,44 @@ def liq_price_for(entry, direction, cfg):
     return entry * (1 - liq_dist_pct) if direction == "long" else entry * (1 + liq_dist_pct)
 
 
-def evaluate_open_position_over_bars(state: dict, bars, cfg: ec.Config):
-    """Ликвидация -> стоп/БУ -> финальный TP -> частичный тейк — но проверяется
-    не по единственной мгновенной цене в момент опроса крона, а по High/Low
-    КАЖДОЙ 1m-свечи с момента последней проверки. Это критично: крон дергает
-    /api/scan раз в 1-5 минут, и если проверять только "текущую" цену на
-    момент вызова, можно пропустить внутрисвечной проброс за SL, если цена
-    успела отскочить обратно к следующему тику (сделка тогда "виснет" и
-    может закрыться по TP, хотя по факту SL уже был пробит).
-
-    Возвращает (events, working_state):
-      events — хронологический список сработавших событий:
-        {"action": "partial", ...} / {"action": "close", "exit_price", "reason", "bar_time"}
-      working_state — обновленное состояние (sl/qty/partials_taken), если
-        позиция не закрылась (events может быть пустым или содержать только
-        partial-события).
-    """
+def check_open_position(state: dict, current_price: float, cfg: ec.Config):
+    """Ликвидация -> стоп/БУ -> финальный TP -> частичный тейк (если задан)."""
     direction = state["direction"]
     entry = state["entry"]
     risk = abs(entry - state["initial_sl"])
     sign = 1 if direction == "long" else -1
     is_long = direction == "long"
 
-    working = dict(state)
-    events = []
+    if state.get("liq_price") is not None:
+        hit_liq = (current_price <= state["liq_price"]) if is_long else (current_price >= state["liq_price"])
+        liq_closer = abs(state["liq_price"] - entry) <= abs(state["sl"] - entry)
+        if hit_liq and liq_closer:
+            return {"action": "close", "exit_price": state["liq_price"], "reason": "LIQUIDATION"}
 
-    for bar_time, row in bars.iterrows():
-        low, high = float(row["low"]), float(row["high"])
+    hit_sl = (current_price <= state["sl"]) if is_long else (current_price >= state["sl"])
+    if hit_sl:
+        reason = "BE" if state["partials_taken"] > 0 else "SL"
+        return {"action": "close", "exit_price": state["sl"], "reason": reason}
 
-        if working.get("liq_price") is not None:
-            liq = working["liq_price"]
-            hit_liq = (low <= liq) if is_long else (high >= liq)
-            liq_closer = abs(liq - entry) <= abs(working["sl"] - entry)
-            if hit_liq and liq_closer:
-                events.append({"action": "close", "exit_price": liq, "reason": "LIQUIDATION", "bar_time": bar_time})
-                return events, working
+    hit_tp = (current_price >= state["tp"]) if is_long else (current_price <= state["tp"])
+    if hit_tp:
+        return {"action": "close", "exit_price": state["tp"], "reason": "TP"}
 
-        hit_sl = (low <= working["sl"]) if is_long else (high >= working["sl"])
-        if hit_sl:
-            reason = "BE" if working["partials_taken"] > 0 else "SL"
-            events.append({"action": "close", "exit_price": working["sl"], "reason": reason, "bar_time": bar_time})
-            return events, working
+    levels = cfg.PARTIAL_TP_LEVELS
+    idx = state["partials_taken"]
+    if idx < len(levels) and risk > 0:
+        r, pct = levels[idx]
+        level_price = entry + sign * r * risk
+        hit_level = (current_price >= level_price) if is_long else (current_price <= level_price)
+        if hit_level:
+            close_qty = min(state["qty"] * pct, state["qty"])
+            return {
+                "action": "partial", "exit_price": level_price, "close_qty": close_qty,
+                "level_r": r, "new_partials_taken": idx + 1,
+                "move_be": cfg.MOVE_SL_TO_BE_AFTER_FIRST_TP and idx == 0,
+            }
 
-        hit_tp = (high >= working["tp"]) if is_long else (low <= working["tp"])
-        if hit_tp:
-            events.append({"action": "close", "exit_price": working["tp"], "reason": "TP", "bar_time": bar_time})
-            return events, working
-
-        levels = cfg.PARTIAL_TP_LEVELS
-        idx = working["partials_taken"]
-        if idx < len(levels) and risk > 0:
-            r, pct = levels[idx]
-            level_price = entry + sign * r * risk
-            hit_level = (high >= level_price) if is_long else (low <= level_price)
-            if hit_level:
-                close_qty = min(working["qty"] * pct, working["qty"])
-                events.append({
-                    "action": "partial", "exit_price": level_price, "close_qty": close_qty,
-                    "level_r": r, "new_partials_taken": idx + 1,
-                    "move_be": cfg.MOVE_SL_TO_BE_AFTER_FIRST_TP and idx == 0,
-                    "bar_time": bar_time,
-                })
-                working["qty"] = working["qty"] - close_qty
-                working["partials_taken"] = idx + 1
-                if cfg.MOVE_SL_TO_BE_AFTER_FIRST_TP and idx == 0:
-                    working["sl"] = entry
-                # частичный тейк не закрывает сделку — продолжаем проверять
-                # оставшиеся свечи этого же прохода (может успеть сработать
-                # и SL@BE, и финальный TP в пределах того же окна проверки)
-
-    return events, working
+    return {"action": "none"}
 
 
 def find_live_entry(setups, current_price: float, last_bar_index: int):
@@ -167,9 +139,99 @@ def find_live_entry(setups, current_price: float, last_bar_index: int):
         if last_bar_index - s.formed_index > ENTRY_LOOKBACK_BARS:
             continue
         lo, hi = sorted([s.entry_zone_bottom, s.entry_zone_top])
-        if lo <= current_price <= hi:
-            return s
+        if not (lo <= current_price <= hi):
+            continue
+        risk_pct = abs(s.entry_ref_price - s.sl_price) / s.entry_ref_price * 100.0
+        if risk_pct < MIN_SL_DISTANCE_PCT:
+            continue  # стоп слишком узкий (шум) — пропускаем этот сетап, ищем следующий
+        return s
     return None
+
+
+def process_job(job: dict, state, current_price: float, base_cfg: ec.Config, context_cache: dict) -> dict:
+    """Обрабатывает одну джобу (проверка открытой позиции ИЛИ поиск нового
+    входа). Вынесено в отдельную функцию, чтобы вызывающий код мог обернуть
+    её в try/except на уровне ОДНОЙ джобы — падение одной не должно мешать
+    проверке остальных (иначе, например, зависшая FVG_REBALANCE_1m могла бы
+    не давать проверяться QUASIMODO_POI_15m в тот же тик)."""
+    job_id = job["id"]
+    cfg = build_job_cfg(job, base_cfg)
+
+    if state and state["symbol"] == SYMBOL:
+        result = check_open_position(state, current_price, cfg)
+
+        if result["action"] == "partial":
+            pnl_part = (result["exit_price"] - state["entry"]) * result["close_qty"] if state["direction"] == "long" \
+                else (state["entry"] - result["exit_price"]) * result["close_qty"]
+            sign_str = "+" if pnl_part >= 0 else ""
+            sh.append_partial_note(
+                state["trade_row"],
+                f"Частичный тейк {sign_str}{pnl_part:.2f}$ на {result['level_r']}R"
+            )
+            new_state = dict(state)
+            new_state["qty"] = state["qty"] - result["close_qty"]
+            new_state["partials_taken"] = result["new_partials_taken"]
+            if result["move_be"]:
+                new_state["sl"] = state["entry"]
+            sh.set_state(job_id, new_state)
+            return {"status": "partial_tp", "pnl_part": round(pnl_part, 2)}
+
+        if result["action"] == "close":
+            pnl = (result["exit_price"] - state["entry"]) * state["qty"] if state["direction"] == "long" \
+                else (state["entry"] - result["exit_price"]) * state["qty"]
+            pnl_pct = (pnl / (state["entry"] * state["qty"])) * 100 if state["qty"] else 0.0
+            sh.update_trade_close(state["trade_row"], result["exit_price"], pnl, pnl_pct, result["reason"])
+            new_balance = sh.update_summary(pnl)
+            sh.clear_state(job_id)
+            sh.set_cooldown_until(job_id, datetime.now(timezone.utc) + timedelta(minutes=COOLDOWN_MINUTES))
+            return {"status": "closed", "reason": result["reason"], "pnl": round(pnl, 2), "balance": round(new_balance, 2)}
+
+        return {"status": "holding"}
+
+    cooldown_until = sh.get_cooldown_until(job_id)
+    if cooldown_until is not None and cooldown_until > datetime.now(timezone.utc):
+        return {"status": "cooldown", "until": cooldown_until.isoformat()}
+
+    cache_key = (job["interval"], job["htf_interval"])
+    if cache_key not in context_cache:
+        ltf_df = bl.get_klines(SYMBOL, job["interval"], KLINES_LIMIT)
+        ltf_ctx = ec.build_smc_context(ltf_df, base_cfg)
+        htf_df = ec.resample_ohlcv(ltf_df, job["htf_interval"])
+        htf_ctx = ec.build_smc_context(htf_df, base_cfg)
+        context_cache[cache_key] = (ltf_df, ltf_ctx, htf_ctx)
+    ltf_df, ltf_ctx, htf_ctx = context_cache[cache_key]
+
+    setups = ec.generate_setups(job["strategy"], ltf_ctx, htf_ctx, base_cfg)
+    last_idx = len(ltf_df) - 1
+    setup = find_live_entry(setups, current_price, last_idx)
+
+    if not setup:
+        return {"status": "no_signal"}
+
+    balance = sh.get_balance(DEFAULT_BALANCE)
+    risk_amount = balance * (RISK_PCT / 100.0)
+    risk_per_unit = abs(setup.entry_ref_price - setup.sl_price)
+    qty = risk_amount / risk_per_unit if risk_per_unit > 0 else 0
+
+    if qty <= 0:
+        return {"status": "invalid_qty"}
+
+    liq_price = liq_price_for(setup.entry_ref_price, setup.direction, cfg)
+    tp_price = (
+        fixed_tp_price(setup.entry_ref_price, setup.direction, setup.sl_price, job["fixed_tp_r"])
+        if job["fixed_tp_r"] is not None else setup.tp_price
+    )
+    trade_row = sh.append_trade_open(
+        job_id, SYMBOL, setup.direction, setup.reason,
+        setup.entry_ref_price, setup.sl_price, tp_price, qty,
+    )
+    sh.set_state(job_id, {
+        "symbol": SYMBOL, "direction": setup.direction,
+        "entry": setup.entry_ref_price, "initial_sl": setup.sl_price,
+        "sl": setup.sl_price, "tp": tp_price, "qty": qty,
+        "partials_taken": 0, "trade_row": trade_row, "liq_price": liq_price,
+    })
+    return {"status": "opened", "direction": setup.direction, "reason": setup.reason, "qty": round(qty, 6)}
 
 
 @app.route("/api/scan", methods=["GET"])
@@ -180,111 +242,26 @@ def scan():
 
     base_cfg = build_base_cfg()
     results = {}
-    # кэш контекста по (interval, htf_interval) — джобы с одинаковым ТФ (как
-    # FVG_REBALANCE_5m и QUASIMODO_POI_5m) не будут дважды тянуть те же свечи
-    # и дважды считать структуру/OB/FVG
     context_cache = {}
 
     try:
         current_price = bl.get_current_price(SYMBOL)
         all_states = sh.get_all_states()
-
-        for job in JOBS:
-            job_id = job["id"]
-            state = all_states.get(job_id)
-            cfg = build_job_cfg(job, base_cfg)
-
-            if state and state["symbol"] == SYMBOL:
-                bars = bl.get_recent_bars_since(SYMBOL, state.get("last_checked"))
-                events, working = evaluate_open_position_over_bars(state, bars, cfg)
-
-                closed = False
-                partial_pnls = []
-                for ev in events:
-                    if ev["action"] == "partial":
-                        pnl_part = (ev["exit_price"] - state["entry"]) * ev["close_qty"] if state["direction"] == "long" \
-                            else (state["entry"] - ev["exit_price"]) * ev["close_qty"]
-                        sign_str = "+" if pnl_part >= 0 else ""
-                        sh.append_partial_note(
-                            state["trade_row"],
-                            f"Частичный тейк {sign_str}{pnl_part:.2f}$ на {ev['level_r']}R"
-                        )
-                        partial_pnls.append(round(pnl_part, 2))
-
-                    elif ev["action"] == "close":
-                        pnl = (ev["exit_price"] - state["entry"]) * working["qty"] if state["direction"] == "long" \
-                            else (state["entry"] - ev["exit_price"]) * working["qty"]
-                        pnl_pct = (pnl / (state["entry"] * working["qty"])) * 100 if working["qty"] else 0.0
-                        sh.update_trade_close(state["trade_row"], ev["exit_price"], pnl, pnl_pct, ev["reason"])
-                        new_balance = sh.update_summary(pnl)
-                        sh.clear_state(job_id)
-                        sh.set_cooldown_until(job_id, datetime.now(timezone.utc) + timedelta(minutes=COOLDOWN_MINUTES))
-                        results[job_id] = {
-                            "status": "closed", "reason": ev["reason"], "pnl": round(pnl, 2),
-                            "balance": round(new_balance, 2), "partials": partial_pnls,
-                        }
-                        closed = True
-                        break
-
-                if not closed:
-                    working["last_checked"] = datetime.now(timezone.utc).isoformat()
-                    sh.set_state(job_id, working)
-                    results[job_id] = {"status": "holding", "partials": partial_pnls} if partial_pnls else {"status": "holding"}
-                continue
-
-            cooldown_until = sh.get_cooldown_until(job_id)
-            if cooldown_until is not None and cooldown_until > datetime.now(timezone.utc):
-                results[job_id] = {"status": "cooldown", "until": cooldown_until.isoformat()}
-                continue
-
-            cache_key = (job["interval"], job["htf_interval"])
-            if cache_key not in context_cache:
-                ltf_df = bl.get_klines(SYMBOL, job["interval"], KLINES_LIMIT)
-                ltf_ctx = ec.build_smc_context(ltf_df, base_cfg)
-                htf_df = ec.resample_ohlcv(ltf_df, job["htf_interval"])
-                htf_ctx = ec.build_smc_context(htf_df, base_cfg)
-                context_cache[cache_key] = (ltf_df, ltf_ctx, htf_ctx)
-            ltf_df, ltf_ctx, htf_ctx = context_cache[cache_key]
-
-            setups = ec.generate_setups(job["strategy"], ltf_ctx, htf_ctx, base_cfg)
-            last_idx = len(ltf_df) - 1
-            setup = find_live_entry(setups, current_price, last_idx)
-
-            if not setup:
-                results[job_id] = {"status": "no_signal"}
-                continue
-
-            balance = sh.get_balance(DEFAULT_BALANCE)
-            risk_amount = balance * (RISK_PCT / 100.0)
-            risk_per_unit = abs(setup.entry_ref_price - setup.sl_price)
-            qty = risk_amount / risk_per_unit if risk_per_unit > 0 else 0
-
-            if qty <= 0:
-                results[job_id] = {"status": "invalid_qty"}
-                continue
-
-            liq_price = liq_price_for(setup.entry_ref_price, setup.direction, cfg)
-            tp_price = (
-                fixed_tp_price(setup.entry_ref_price, setup.direction, setup.sl_price, job["fixed_tp_r"])
-                if job["fixed_tp_r"] is not None else setup.tp_price
-            )
-            trade_row = sh.append_trade_open(
-                job_id, SYMBOL, setup.direction, setup.reason,
-                setup.entry_ref_price, setup.sl_price, tp_price, qty,
-            )
-            sh.set_state(job_id, {
-                "symbol": SYMBOL, "direction": setup.direction,
-                "entry": setup.entry_ref_price, "initial_sl": setup.sl_price,
-                "sl": setup.sl_price, "tp": tp_price, "qty": qty,
-                "partials_taken": 0, "trade_row": trade_row, "liq_price": liq_price,
-                "last_checked": datetime.now(timezone.utc).isoformat(),
-            })
-            results[job_id] = {"status": "opened", "direction": setup.direction, "reason": setup.reason, "qty": round(qty, 6)}
-
-        return jsonify({"price": current_price, "results": results})
-
     except Exception as e:
-        return jsonify({"error": str(e)}), 500
+        # это критично для ВСЕХ джоб сразу (нет цены/состояния — нечего проверять)
+        return jsonify({"error": f"critical: {e}"}), 500
+
+    for job in JOBS:
+        job_id = job["id"]
+        try:
+            state = all_states.get(job_id)
+            results[job_id] = process_job(job, state, current_price, base_cfg, context_cache)
+        except Exception as e:
+            # падение ОДНОЙ джобы не должно мешать проверке остальных —
+            # именно это раньше могло "подвешивать" другие открытые позиции
+            results[job_id] = {"status": "error", "error": str(e)}
+
+    return jsonify({"price": current_price, "results": results})
 
 
 if __name__ == "__main__":
