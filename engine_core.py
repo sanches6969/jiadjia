@@ -437,10 +437,21 @@ def premium_discount_zone(swing_high: float, swing_low: float, price: float) -> 
     0% = swing_low, 100% = swing_high. <50% = Discount (выгодно для покупок),
     >=50% = Premium (выгодно для продаж).
     Возвращает (zone, pct_in_range).
+
+    Если price оказалась ВНЕ диапазона [swing_low, swing_high] (pct < 0 или
+    > 100) — это значит, что цена уже ушла за пределы последнего известного
+    свинга, а новый подтверждённый свинг ещё не сформировался (структура
+    устарела). В этом случае зона считается невалидной ("n/a"), а не просто
+    "премиум"/"дисконт" по одному только знаку — иначе стратегии вроде
+    QUASIMODO_POI/HTF_POI_LTF_OB могут открывать сделки против уже
+    неактуального диапазона (наблюдалось в live как "premium 181%" —
+    признак именно этой ошибки).
     """
     if swing_high == swing_low:
         return "n/a", 50.0
     pct = (price - swing_low) / (swing_high - swing_low) * 100
+    if pct < 0 or pct > 100:
+        return "n/a", pct
     zone = "discount" if pct < 50 else "premium"
     return zone, pct
 
