@@ -90,7 +90,11 @@ CFG = Config()
 
 def resample_ohlcv(df: pd.DataFrame, rule: str) -> pd.DataFrame:
     """Ресемплирует LTF OHLCV в HTF (используется для top-down контекста)."""
-    out = df.resample(rule).agg({
+    # pandas>=2.2: '15m' → '15min' (алиас 'm' = month end)
+    r = rule.strip().lower()
+    if len(r) >= 2 and r[-1] == "m" and not r.endswith("min") and not r.endswith("ms"):
+        r = r[:-1] + "min"
+    out = df.resample(r).agg({
         "open": "first", "high": "max", "low": "min", "close": "last", "volume": "sum",
     })
     out.dropna(inplace=True)
@@ -665,10 +669,10 @@ def strategy_quasimodo_poi(ltf: SMCContext, htf: SMCContext, cfg: Config) -> lis
     df = ltf.df
     htf_times = htf.df.index
     struct_rows = ltf.structure.to_dict("records") if not ltf.structure.empty else []
-    MIN_DEEP_DISCOUNT = 35.0   # pct < 35 = deep discount
-    MIN_DEEP_PREMIUM = 65.0    # pct > 65 = deep premium
-    MAX_OB_AGE_BARS = 40
-    MIN_SL_PCT = 0.25
+    MIN_DEEP_DISCOUNT = 40.0   # pct < 40 (было 35 — слишком мало сетапов)
+    MIN_DEEP_PREMIUM = 60.0    # pct > 60 (было 65)
+    MAX_OB_AGE_BARS = 60
+    MIN_SL_PCT = 0.12          # было 0.25 — на 5m crypto стопы часто 0.12–0.25%
 
     for row in struct_rows:
         if row["type"] != "CHOCH":
@@ -748,8 +752,8 @@ def strategy_fvg_rebalance(ltf: SMCContext, cfg: Config) -> list[Setup]:
     setups: list[Setup] = []
     df = ltf.df
     n = len(df)
-    MAX_FVG_AGE = 25
-    MIN_FVG_WIDTH_PCT = 0.30
+    MAX_FVG_AGE = 40
+    MIN_FVG_WIDTH_PCT = 0.05   # было 0.30 — на ETH/BTC 5m типичный FVG 0.05–0.20%
 
     # текущий bias по структуре
     bias = None
