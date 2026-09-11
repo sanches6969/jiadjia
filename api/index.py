@@ -18,39 +18,37 @@ RISK_PCT = float(os.environ.get("RISK_PCT", "1"))
 MAX_LEVERAGE = float(os.environ.get("MAX_LEVERAGE", "10"))
 DEFAULT_BALANCE = float(os.environ.get("INITIAL_BALANCE", "1000"))
 KLINES_LIMIT = int(os.environ.get("KLINES_LIMIT", "500"))
-ENTRY_LOOKBACK_BARS = int(os.environ.get("ENTRY_LOOKBACK_BARS", "30"))  # было 50 — меньше «протухших» сетапов
-COOLDOWN_MINUTES = float(os.environ.get("COOLDOWN_MINUTES", "180"))     # было 60 — дольше после SL
-# отсекает сетапы с шумовым (слишком узким) стопом — частая проблема на 1m,
-# где гэп между свечами иногда получается почти нулевым; такие входы
-# статистически почти всегда сразу вылетают по стопу
-MIN_SL_DISTANCE_PCT = float(os.environ.get("MIN_SL_DISTANCE_PCT", "0.12"))  # 0.30 давал 0 сделок на ETH/BTC
+ENTRY_LOOKBACK_BARS = int(os.environ.get("ENTRY_LOOKBACK_BARS", "45"))
+# После SL не долбим тот же сетап сразу (у тебя это жрало депозит на QM)
+COOLDOWN_MINUTES = float(os.environ.get("COOLDOWN_MINUTES", "90"))
+# Шумовой стоп — только совсем микро-гэпы; 0.10% не режет нормальные FVG
+MIN_SL_DISTANCE_PCT = float(os.environ.get("MIN_SL_DISTANCE_PCT", "0.10"))
 
 # ==============================================================================
-# Базовые шаблоны стратегий (без символа). На каждый символ из SYMBOLS
-# создаётся отдельный джоб с id вида "ETHUSDT_FVG_REBALANCE_5m".
-# Джобы заточены под winrate, а не под максимальный RR.
+# Возврат к ТВОЕЙ прибыльной схеме: низкий WR + высокий RR.
+# FVG: 4R без partial (как в исходном live).
+# QM 5m: 3R + partial 50%@1R (BE после первого тейка).
+# QM 15m выключен — единственный стабильно минусовой джоб в статистике.
 # ==============================================================================
 _JOB_TEMPLATES = [
     {
         "strategy": "FVG_REBALANCE",
         "interval": "5m", "htf_interval": "1h",
-        "fixed_tp_r": 2.5, "partial_r": 1.0, "partial_pct": 0.5,
+        "fixed_tp_r": 4.0, "partial_r": None, "partial_pct": 0.0,  # 4R no partial
         "suffix": "FVG_REBALANCE_5m",
     },
     {
         "strategy": "QUASIMODO_POI",
         "interval": "5m", "htf_interval": "1h",
-        "fixed_tp_r": 2.0, "partial_r": 1.0, "partial_pct": 0.5,
+        "fixed_tp_r": 3.0, "partial_r": 1.0, "partial_pct": 0.5,  # 3R + 50%@1R
         "suffix": "QUASIMODO_POI_5m",
     },
     {
         "strategy": "FVG_REBALANCE",
         "interval": "1m", "htf_interval": "15m",
-        "fixed_tp_r": 2.0, "partial_r": 1.0, "partial_pct": 0.5,
+        "fixed_tp_r": 4.0, "partial_r": None, "partial_pct": 0.0,  # 4R no partial
         "suffix": "FVG_REBALANCE_1m",
     },
-    # QUASIMODO_POI_15m отключён — по live-статистике худший WR (~29%)
-    # и единственный минусовой джоб (−$243). Оставлен только 5m QM.
 ]
 
 JOBS = []
@@ -162,8 +160,8 @@ def find_live_entry(setups, current_price: float, last_bar_index: int):
         if risk_pct < MIN_SL_DISTANCE_PCT:
             continue  # стоп слишком узкий (шум)
         zone_width_pct = (hi - lo) / ((hi + lo) / 2) * 100.0 if (hi + lo) else 0
-        if zone_width_pct > 1.5:
-            continue  # слишком широкая зона входа — качество сетапа низкое
+        if zone_width_pct > 2.5:
+            continue  # слишком широкая зона входа
         return s
     return None
 
