@@ -54,7 +54,7 @@ class Config:
         (4.0, 0.25),                # фиксация 25% при RR 1:4 (остаток держим к финал TP)
     ]
     MOVE_SL_TO_BE_AFTER_FIRST_TP = True
-    MIN_RR_FILTER = 1.5             # исходная прибыльная версия (высокий RR важнее WR)
+    MIN_RR_FILTER = 1.5             # не открывать сделку, если потенциальный RR ниже
 
     # ----- Структура / фракталы -----
     SWING_LEFT = 3                  # баров слева для фрактального свинга
@@ -90,7 +90,7 @@ CFG = Config()
 
 def resample_ohlcv(df: pd.DataFrame, rule: str) -> pd.DataFrame:
     """Ресемплирует LTF OHLCV в HTF (используется для top-down контекста)."""
-    # pandas>=2.2: '15m' → '15min' (алиас 'm' = month end)
+    # pandas>=2.2: '15m' invalid (m = month) -> '15min'
     r = rule.strip().lower()
     if len(r) >= 2 and r[-1] == "m" and not r.endswith("min") and not r.endswith("ms"):
         r = r[:-1] + "min"
@@ -658,23 +658,11 @@ def strategy_quasimodo_poi(ltf: SMCContext, htf: SMCContext, cfg: Config) -> lis
     3 фазы: формирование свинг-хая/лоу -> снятие ликвидности -> слом структуры (CHOCH),
     с ретестом OB/Breaker/FVG. Используется только внутри HTF POI (discount для лонга,
     premium для шорта).
-
-    Ужесточения для winrate:
-    - только глубокий discount (<35%) / premium (>65%)
-    - OB не старше 40 баров LTF от CHOCH
-    - SL-дистанция >= 0.25% от цены (отсекает шум)
-    - минимум RR 2.0
     """
     setups: list[Setup] = []
     df = ltf.df
     htf_times = htf.df.index
     struct_rows = ltf.structure.to_dict("records") if not ltf.structure.empty else []
-    # Мягкий premium/discount (как раньше: <50 discount / >=50 premium),
-    # но отсекаем совсем краёвые n/a и слишком старые OB.
-    MIN_DEEP_DISCOUNT = 50.0
-    MIN_DEEP_PREMIUM = 50.0
-    MAX_OB_AGE_BARS = 50
-    MIN_SL_PCT = 0.10
 
     for row in struct_rows:
         if row["type"] != "CHOCH":
@@ -692,22 +680,15 @@ def strategy_quasimodo_poi(ltf: SMCContext, htf: SMCContext, cfg: Config) -> lis
             continue
         sw_h, sw_l = recent_highs[-1].price, recent_lows[-1].price
         zone, pct = premium_discount_zone(sw_h, sw_l, df["close"].values[i])
-        if zone == "n/a":
+        if direction == "long" and zone != "discount":
             continue
-        # только глубокие зоны — резко снижает число ложных ретестов
-        if direction == "long" and not (zone == "discount" and pct < MIN_DEEP_DISCOUNT):
-            continue
-        if direction == "short" and not (zone == "premium" and pct > MIN_DEEP_PREMIUM):
+        if direction == "short" and zone != "premium":
             continue
 
-        # ближайший OB того же направления, не старше MAX_OB_AGE_BARS
-        candidate_obs = [
-            ob for ob in ltf.obs
-            if ob.index <= i
-            and (i - ob.index) <= MAX_OB_AGE_BARS
-            and ((direction == "long" and ob.kind == "bullish")
-                 or (direction == "short" and ob.kind == "bearish"))
-        ]
+        # ищем ближайший OB того же направления, сформированный до CHOCH, как зону ретеста
+        candidate_obs = [ob for ob in ltf.obs
+                          if ob.index <= i and ((direction == "long" and ob.kind == "bullish")
+                                                 or (direction == "short" and ob.kind == "bearish"))]
         if not candidate_obs:
             continue
         ob = candidate_obs[-1]
@@ -717,8 +698,6 @@ def strategy_quasimodo_poi(ltf: SMCContext, htf: SMCContext, cfg: Config) -> lis
             risk = entry - sl
             if risk <= 0:
                 continue
-            if (risk / entry) * 100 < MIN_SL_PCT:
-                continue
             tp = sw_h
             if (tp - entry) / risk < cfg.MIN_RR_FILTER:
                 continue
@@ -727,8 +706,6 @@ def strategy_quasimodo_poi(ltf: SMCContext, htf: SMCContext, cfg: Config) -> lis
             entry = ob.open_
             risk = sl - entry
             if risk <= 0:
-                continue
-            if (risk / entry) * 100 < MIN_SL_PCT:
                 continue
             tp = sw_l
             if (entry - tp) / risk < cfg.MIN_RR_FILTER:
@@ -744,53 +721,26 @@ def strategy_fvg_rebalance(ltf: SMCContext, cfg: Config) -> list[Setup]:
     [FVG_REBALANCE] Вход на ребалансе FVG по уровню 0.5 (модуль 9).
     Направление сделки = направление самого FVG (бычий FVG -> лонг от 0.5,
     медвежий FVG -> шорт от 0.5), стоп — за дальнюю границу FVG.
-
-    Ужесточения для winrate:
-    - FVG не старше 25 баров и ещё не fill'нут
-    - ширина FVG >= 0.30% (отсекает микро-гэпы на 1m)
-    - вход только в сторону текущей структуры (последний BOS/CHOCH)
-    - TP = 2.5R вместо 3R (выше вероятность попадания)
     """
     setups: list[Setup] = []
     df = ltf.df
-    n = len(df)
-    MAX_FVG_AGE = 30
-    MIN_FVG_WIDTH_PCT = 0.04   # не режем нормальные 5m FVG
-
-    # текущий bias по структуре
-    bias = None
-    if not ltf.structure.empty:
-        last = ltf.structure.iloc[-1]
-        bias = "long" if last["direction"] == "up" else "short"
-
     for gap in ltf.fvgs:
         if gap.invalidated_index is not None:
             continue
-        age = n - 1 - (gap.start_index + 1)
-        if age < 0 or age > MAX_FVG_AGE:
-            continue
-        width_pct = (gap.top - gap.bottom) / gap.mid * 100.0 if gap.mid else 0
-        if width_pct < MIN_FVG_WIDTH_PCT:
-            continue
-
         direction = "long" if gap.kind == "bullish" else "short"
-        # фильтр по структуре — не торгуем против последнего слома
-        if bias is not None and direction != bias:
-            continue
-
         entry = gap.mid
         if direction == "long":
             sl = gap.bottom
             risk = entry - sl
             if risk <= 0:
                 continue
-            tp = entry + risk * 4.0
+            tp = entry + risk * 3.0
         else:
             sl = gap.top
             risk = sl - entry
             if risk <= 0:
                 continue
-            tp = entry - risk * 4.0
+            tp = entry - risk * 3.0
         setups.append(Setup(gap.start_index + 1, direction, gap.top, gap.bottom, entry, sl, tp,
                              "FVG_REBALANCE", f"{gap.kind} FVG rebalance @0.5"))
     return setups
