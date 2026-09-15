@@ -44,7 +44,6 @@ def _sheet_id():
 
 
 def _safe_float(val, default=None):
-    """Пустая строка / None / мусор из Sheets не роняют float()."""
     if val is None or val == "":
         return default
     try:
@@ -66,16 +65,9 @@ def get_all_states() -> dict:
     """dict: strategy_name -> state dict (только для стратегий с РЕАЛЬНО открытой
     позицией — строка-якорь по стратегии в Sheets может существовать и при
     закрытой позиции, чтобы хранить cooldown, поэтому проверяем именно Symbol,
-    а не сам факт наличия строки).
-
-    Битые/полупустые строки (Symbol есть, а Entry/SL пустые) пропускаются,
-    чтобы пустая ячейка не роняла весь /api/scan с float('').
-    """
+    а не сам факт наличия строки)."""
     svc = _client()
-    res = svc.spreadsheets().values().get(
-        spreadsheetId=_sheet_id(), range="State!A2:M50",
-        valueRenderOption="UNFORMATTED_VALUE",
-    ).execute()
+    res = svc.spreadsheets().values().get(spreadsheetId=_sheet_id(), range="State!A2:M50", valueRenderOption="UNFORMATTED_VALUE").execute()
     rows = res.get("values", [])
     states = {}
     for row in rows:
@@ -89,9 +81,8 @@ def get_all_states() -> dict:
         sl = _safe_float(row[5])
         tp = _safe_float(row[6])
         qty = _safe_float(row[7])
-        # неполная строка (после ручной правки таблицы) — игнорируем
         if None in (entry, initial_sl, sl, tp, qty):
-            continue
+            continue  # битая/пустая строка State — не роняем весь scan
         states[row[0]] = {
             "strategy": row[0], "symbol": row[1], "direction": row[2] or "",
             "entry": entry, "initial_sl": initial_sl, "sl": sl,
@@ -105,10 +96,7 @@ def get_all_states() -> dict:
 
 
 def _find_state_row(svc, strategy):
-    res = svc.spreadsheets().values().get(
-        spreadsheetId=_sheet_id(), range="State!A2:A50",
-        valueRenderOption="UNFORMATTED_VALUE",
-    ).execute()
+    res = svc.spreadsheets().values().get(spreadsheetId=_sheet_id(), range="State!A2:A50", valueRenderOption="UNFORMATTED_VALUE").execute()
     for i, row in enumerate(res.get("values", [])):
         if row and row[0] == strategy:
             return i + 2
@@ -200,10 +188,7 @@ def set_cooldown_until(strategy: str, until_dt):
 
 def get_balance(default_balance: float) -> float:
     svc = _client()
-    res = svc.spreadsheets().values().get(
-        spreadsheetId=_sheet_id(), range="Summary!E2",
-        valueRenderOption="UNFORMATTED_VALUE",
-    ).execute()
+    res = svc.spreadsheets().values().get(spreadsheetId=_sheet_id(), range="Summary!E2", valueRenderOption="UNFORMATTED_VALUE").execute()
     vals = res.get("values", [])
     if not vals or not vals[0]:
         return default_balance
@@ -249,20 +234,16 @@ def update_trade_close(row: int, exit_price: float, pnl: float, pnl_pct: float, 
 
 def update_summary(pnl: float) -> float:
     svc = _client()
-    res = svc.spreadsheets().values().get(
-        spreadsheetId=_sheet_id(), range="Summary!A2:E2",
-        valueRenderOption="UNFORMATTED_VALUE",
-    ).execute()
-    raw = res.get("values", [])
-    row = (raw[0] if raw else ["0", "0", "0", "0", "1000"]) + ["0"] * 5
-    total = _safe_int(row[0], 0) + 1
-    wins = _safe_int(row[1], 0) + (1 if pnl > 0 else 0)
-    losses = _safe_int(row[2], 0) + (1 if pnl <= 0 else 0)
-    total_pnl = (_safe_float(row[3], 0.0) or 0.0) + pnl
-    balance = (_safe_float(row[4], 1000.0) or 1000.0) + pnl
+    res = svc.spreadsheets().values().get(spreadsheetId=_sheet_id(), range="Summary!A2:E2", valueRenderOption="UNFORMATTED_VALUE").execute()
+    row = res.get("values", [["0", "0", "0", "0", "1000"]])[0]
+    row = row + ["0"] * (5 - len(row))
+    total = int(row[0] or 0) + 1
+    wins = int(row[1] or 0) + (1 if pnl > 0 else 0)
+    losses = int(row[2] or 0) + (1 if pnl <= 0 else 0)
+    total_pnl = float(row[3] or 0) + pnl
+    balance = float(row[4] or 1000) + pnl
     svc.spreadsheets().values().update(
         spreadsheetId=_sheet_id(), range="Summary!A2:E2",
         valueInputOption="RAW",
-        body={"values": [[total, wins, losses, round(total_pnl, 2), round(balance, 2)]]},
-    ).execute()
+        body={"values": [[total, wins, losses, round(total_pnl, 2), round(balance, 2)]]}).execute()
     return balance
