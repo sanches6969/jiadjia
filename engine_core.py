@@ -54,7 +54,7 @@ class Config:
         (4.0, 0.25),                # фиксация 25% при RR 1:4 (остаток держим к финал TP)
     ]
     MOVE_SL_TO_BE_AFTER_FIRST_TP = True
-    MIN_RR_FILTER = 2.0             # не открывать сделку, если потенциальный RR ниже (было 1.5)
+    MIN_RR_FILTER = 1.5             # исходная прибыльная версия (высокий RR важнее WR)
 
     # ----- Структура / фракталы -----
     SWING_LEFT = 3                  # баров слева для фрактального свинга
@@ -669,10 +669,12 @@ def strategy_quasimodo_poi(ltf: SMCContext, htf: SMCContext, cfg: Config) -> lis
     df = ltf.df
     htf_times = htf.df.index
     struct_rows = ltf.structure.to_dict("records") if not ltf.structure.empty else []
-    MIN_DEEP_DISCOUNT = 40.0   # pct < 40 (было 35 — слишком мало сетапов)
-    MIN_DEEP_PREMIUM = 60.0    # pct > 60 (было 65)
-    MAX_OB_AGE_BARS = 60
-    MIN_SL_PCT = 0.12          # было 0.25 — на 5m crypto стопы часто 0.12–0.25%
+    # Мягкий premium/discount (как раньше: <50 discount / >=50 premium),
+    # но отсекаем совсем краёвые n/a и слишком старые OB.
+    MIN_DEEP_DISCOUNT = 50.0
+    MIN_DEEP_PREMIUM = 50.0
+    MAX_OB_AGE_BARS = 50
+    MIN_SL_PCT = 0.10
 
     for row in struct_rows:
         if row["type"] != "CHOCH":
@@ -718,7 +720,7 @@ def strategy_quasimodo_poi(ltf: SMCContext, htf: SMCContext, cfg: Config) -> lis
             if (risk / entry) * 100 < MIN_SL_PCT:
                 continue
             tp = sw_h
-            if (tp - entry) / risk < max(cfg.MIN_RR_FILTER, 2.0):
+            if (tp - entry) / risk < cfg.MIN_RR_FILTER:
                 continue
         else:
             sl = ob.high
@@ -729,7 +731,7 @@ def strategy_quasimodo_poi(ltf: SMCContext, htf: SMCContext, cfg: Config) -> lis
             if (risk / entry) * 100 < MIN_SL_PCT:
                 continue
             tp = sw_l
-            if (entry - tp) / risk < max(cfg.MIN_RR_FILTER, 2.0):
+            if (entry - tp) / risk < cfg.MIN_RR_FILTER:
                 continue
 
         setups.append(Setup(ob.index, direction, ob.high, ob.low, entry, sl, tp,
@@ -752,8 +754,8 @@ def strategy_fvg_rebalance(ltf: SMCContext, cfg: Config) -> list[Setup]:
     setups: list[Setup] = []
     df = ltf.df
     n = len(df)
-    MAX_FVG_AGE = 40
-    MIN_FVG_WIDTH_PCT = 0.05   # было 0.30 — на ETH/BTC 5m типичный FVG 0.05–0.20%
+    MAX_FVG_AGE = 30
+    MIN_FVG_WIDTH_PCT = 0.04   # не режем нормальные 5m FVG
 
     # текущий bias по структуре
     bias = None
@@ -782,13 +784,13 @@ def strategy_fvg_rebalance(ltf: SMCContext, cfg: Config) -> list[Setup]:
             risk = entry - sl
             if risk <= 0:
                 continue
-            tp = entry + risk * 2.5
+            tp = entry + risk * 4.0
         else:
             sl = gap.top
             risk = sl - entry
             if risk <= 0:
                 continue
-            tp = entry - risk * 2.5
+            tp = entry - risk * 4.0
         setups.append(Setup(gap.start_index + 1, direction, gap.top, gap.bottom, entry, sl, tp,
                              "FVG_REBALANCE", f"{gap.kind} FVG rebalance @0.5"))
     return setups
