@@ -33,6 +33,13 @@ MIN_SL_DISTANCE_PCT = float(os.environ.get("MIN_SL_DISTANCE_PCT", "0.10"))
 # FVG: 4R без partial (как в исходном live).
 # QM 5m: 3R + partial 50%@1R (BE после первого тейка).
 # QM 15m выключен — единственный стабильно минусовой джоб в статистике.
+# FVG_REBALANCE_1m ВЫКЛЮЧЕН 2026-09-23: по статистике 7/7 сделок закрыты по
+# SL (0% winrate, -67.36 суммарно на обоих символах). На 1-минутном графике
+# BTC/ETH обычный шум одной свечи регулярно превышает MIN_SL_DISTANCE_PCT
+# (0.10%), поэтому стоп выбивает почти всегда, ещё до того как сетап успевает
+# отработать. Если захочешь вернуть — либо подними для этого job'а стоп
+# отдельно (напр. свой MIN_SL_DISTANCE_PCT ~0.20-0.25%), либо просто убери
+# комментарии ниже.
 # ==============================================================================
 _JOB_TEMPLATES = [
     {
@@ -47,12 +54,12 @@ _JOB_TEMPLATES = [
         "fixed_tp_r": 3.0, "partial_r": 1.0, "partial_pct": 0.5,  # 3R + 50%@1R
         "suffix": "QUASIMODO_POI_5m",
     },
-    {
-        "strategy": "FVG_REBALANCE",
-        "interval": "1m", "htf_interval": "15m",
-        "fixed_tp_r": 4.0, "partial_r": None, "partial_pct": 0.0,  # 4R no partial
-        "suffix": "FVG_REBALANCE_1m",
-    },
+    # {
+    #     "strategy": "FVG_REBALANCE",
+    #     "interval": "1m", "htf_interval": "15m",
+    #     "fixed_tp_r": 4.0, "partial_r": None, "partial_pct": 0.0,  # 4R no partial
+    #     "suffix": "FVG_REBALANCE_1m",
+    # },
 ]
 
 JOBS = []
@@ -150,22 +157,35 @@ def check_open_position(state: dict, current_price: float, cfg: ec.Config):
     return {"action": "none"}
 
 
+# Ширина зоны входа не должна съедать риск: если зона, где мы ещё согласны
+# исполниться, шире, чем доля от дистанции до SL, реальная цена филла может
+# оказаться намного ближе к стопу, чем думает сайзинг позиции — отсюда
+# мгновенные SL через 2-10 минут после входа при формально нормальном RR.
+MAX_ZONE_TO_RISK_FRAC = float(os.environ.get("MAX_ZONE_TO_RISK_FRAC", "0.3"))
+
+
 def find_live_entry(setups, current_price: float, last_bar_index: int):
     """Берём самый свежий валидный сетап. Доп. фильтр: цена должна быть
-    внутри зоны входа, SL не шумовой, и зона не шире 1.5% (иначе слишком
-    размытый entry → плохое R)."""
+    внутри зоны входа, реальный риск (от ТЕКУЩЕЙ цены до SL, а не от
+    исторического entry_ref_price сетапа) не шумовой, и ширина зоны входа
+    ограничена долей от этого риска (MAX_ZONE_TO_RISK_FRAC) — иначе
+    фактический филл может оказаться намного ближе к стопу, чем думает
+    сайзинг позиции."""
     for s in sorted(setups, key=lambda s: s.formed_index, reverse=True):
         if last_bar_index - s.formed_index > ENTRY_LOOKBACK_BARS:
             continue
         lo, hi = sorted([s.entry_zone_bottom, s.entry_zone_top])
         if not (lo <= current_price <= hi):
             continue
-        risk_pct = abs(s.entry_ref_price - s.sl_price) / s.entry_ref_price * 100.0
+        risk_to_sl = abs(current_price - s.sl_price)
+        if risk_to_sl <= 0:
+            continue
+        risk_pct = risk_to_sl / current_price * 100.0
         if risk_pct < MIN_SL_DISTANCE_PCT:
             continue  # стоп слишком узкий (шум)
-        zone_width_pct = (hi - lo) / ((hi + lo) / 2) * 100.0 if (hi + lo) else 0
-        if zone_width_pct > 2.5:
-            continue  # слишком широкая зона входа
+        zone_width = hi - lo
+        if zone_width > risk_to_sl * MAX_ZONE_TO_RISK_FRAC:
+            continue  # зона входа слишком широкая относительно дистанции до стопа
         return s
     return None
 
@@ -236,27 +256,38 @@ def process_job(job: dict, state, current_price: float, base_cfg: ec.Config, con
     if not setup:
         return {"status": "no_signal", "symbol": symbol}
 
+    # Реальный вход — по факту исполнения (текущая цена тика), а не
+    # исторический entry_ref_price сетапа. SL остаётся на структурном
+    # уровне (там сетап реально инвалидируется), но риск/сайзинг/TP
+    # считаем от настоящей цены входа — иначе R-мультипл строится на
+    # дистанции, которой к моменту факта входа уже могло не быть.
+    entry_price = current_price
+    sl_price = setup.sl_price
+    risk_per_unit = abs(entry_price - sl_price)
+
+    if risk_per_unit <= 0:
+        return {"status": "invalid_risk", "symbol": symbol}
+
     balance = sh.get_balance(DEFAULT_BALANCE)
     risk_amount = balance * (RISK_PCT / 100.0)
-    risk_per_unit = abs(setup.entry_ref_price - setup.sl_price)
-    qty = risk_amount / risk_per_unit if risk_per_unit > 0 else 0
+    qty = risk_amount / risk_per_unit
 
     if qty <= 0:
         return {"status": "invalid_qty", "symbol": symbol}
 
-    liq_price = liq_price_for(setup.entry_ref_price, setup.direction, cfg)
+    liq_price = liq_price_for(entry_price, setup.direction, cfg)
     tp_price = (
-        fixed_tp_price(setup.entry_ref_price, setup.direction, setup.sl_price, job["fixed_tp_r"])
+        fixed_tp_price(entry_price, setup.direction, sl_price, job["fixed_tp_r"])
         if job["fixed_tp_r"] is not None else setup.tp_price
     )
     trade_row = sh.append_trade_open(
         job_id, symbol, setup.direction, setup.reason,
-        setup.entry_ref_price, setup.sl_price, tp_price, qty,
+        entry_price, sl_price, tp_price, qty,
     )
     sh.set_state(job_id, {
         "symbol": symbol, "direction": setup.direction,
-        "entry": setup.entry_ref_price, "initial_sl": setup.sl_price,
-        "sl": setup.sl_price, "tp": tp_price, "qty": qty,
+        "entry": entry_price, "initial_sl": sl_price,
+        "sl": sl_price, "tp": tp_price, "qty": qty,
         "partials_taken": 0, "trade_row": trade_row, "liq_price": liq_price,
     })
     return {
