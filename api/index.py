@@ -164,30 +164,49 @@ def check_open_position(state: dict, current_price: float, cfg: ec.Config):
 MAX_ZONE_TO_RISK_FRAC = float(os.environ.get("MAX_ZONE_TO_RISK_FRAC", "0.3"))
 
 
-def find_live_entry(setups, current_price: float, last_bar_index: int):
-    """Берём самый свежий валидный сетап. Доп. фильтр: цена должна быть
-    внутри зоны входа, реальный риск (от ТЕКУЩЕЙ цены до SL, а не от
-    исторического entry_ref_price сетапа) не шумовой, и ширина зоны входа
-    ограничена долей от этого риска (MAX_ZONE_TO_RISK_FRAC) — иначе
-    фактический филл может оказаться намного ближе к стопу, чем думает
+# Сколько последних (закрытых) баров ТФ сетапа учитывать как "недавний диапазон
+# цены" при поиске входа — иначе вход по одной мгновенной цене тика систематически
+# пропускает сетапы, где цена коснулась зоны и ушла МЕЖДУ двумя опросами крона
+# (тот же самый класс проблемы, из-за которого уже добавлен get_recent_bars_since
+# для отслеживания SL/TP открытых позиций — здесь применяем ту же идею к входу).
+RECENT_TOUCH_LOOKBACK_BARS = int(os.environ.get("RECENT_TOUCH_LOOKBACK_BARS", "2"))
+
+
+def find_live_entry(setups, current_price: float, last_bar_index: int,
+                     recent_high: float = None, recent_low: float = None):
+    """Берём самый свежий валидный сетап. Доп. фильтр: цена должна пересекаться
+    с зоной входа — либо мгновенный тик (current_price), либо (если переданы)
+    диапазон последних RECENT_TOUCH_LOOKBACK_BARS баров, чтобы не пропускать
+    касания зоны между опросами крона. Реальный риск считается от ЦЕНЫ ФИЛЛА
+    (зажатой в границы зоны, если тик уже успел уйти дальше) до SL, ширина
+    зоны входа ограничена долей от этого риска (MAX_ZONE_TO_RISK_FRAC) —
+    иначе фактический филл может оказаться намного ближе к стопу, чем думает
     сайзинг позиции."""
+    hi_bound = recent_high if recent_high is not None else current_price
+    lo_bound = recent_low if recent_low is not None else current_price
+
     for s in sorted(setups, key=lambda s: s.formed_index, reverse=True):
         if last_bar_index - s.formed_index > ENTRY_LOOKBACK_BARS:
             continue
         lo, hi = sorted([s.entry_zone_bottom, s.entry_zone_top])
-        if not (lo <= current_price <= hi):
+        # пересечение [lo_bound, hi_bound] (недавний диапазон цены) с [lo, hi] (зона входа)
+        if hi_bound < lo or lo_bound > hi:
             continue
-        risk_to_sl = abs(current_price - s.sl_price)
+        # цена филла: текущий тик, зажатый в границы зоны — если тик уже вышел
+        # за пределы зоны (а мы поймали её только по recent_high/low), считаем
+        # риск/размер от ближайшей границы зоны, а не от цены, которой уже нет
+        fill_price = min(max(current_price, lo), hi)
+        risk_to_sl = abs(fill_price - s.sl_price)
         if risk_to_sl <= 0:
             continue
-        risk_pct = risk_to_sl / current_price * 100.0
+        risk_pct = risk_to_sl / fill_price * 100.0
         if risk_pct < MIN_SL_DISTANCE_PCT:
             continue  # стоп слишком узкий (шум)
         zone_width = hi - lo
         if zone_width > risk_to_sl * MAX_ZONE_TO_RISK_FRAC:
             continue  # зона входа слишком широкая относительно дистанции до стопа
-        return s
-    return None
+        return s, fill_price
+    return None, None
 
 
 def process_job(job: dict, state, current_price: float, base_cfg: ec.Config, context_cache: dict) -> dict:
@@ -251,17 +270,26 @@ def process_job(job: dict, state, current_price: float, base_cfg: ec.Config, con
 
     setups = ec.generate_setups(job["strategy"], ltf_ctx, htf_ctx, base_cfg)
     last_idx = len(ltf_df) - 1
-    setup = find_live_entry(setups, current_price, last_idx)
+
+    # диапазон последних N ЗАКРЫТЫХ баров — ловим касания зоны между опросами крона
+    recent_slice = ltf_df.iloc[-RECENT_TOUCH_LOOKBACK_BARS:]
+    recent_high = max(recent_slice["high"].max(), current_price)
+    recent_low = min(recent_slice["low"].min(), current_price)
+
+    setup, fill_price = find_live_entry(setups, current_price, last_idx, recent_high, recent_low)
 
     if not setup:
-        return {"status": "no_signal", "symbol": symbol}
+        # диагностика: сколько сетапов вообще нашла стратегия (даже если ни
+        # один не прошел проверку зоны/риска) — чтобы не гадать вслепую,
+        # "стратегия ничего не находит" это или "находит, но фильтр режет"
+        return {"status": "no_signal", "symbol": symbol, "setups_found": len(setups)}
 
-    # Реальный вход — по факту исполнения (текущая цена тика), а не
-    # исторический entry_ref_price сетапа. SL остаётся на структурном
-    # уровне (там сетап реально инвалидируется), но риск/сайзинг/TP
-    # считаем от настоящей цены входа — иначе R-мультипл строится на
-    # дистанции, которой к моменту факта входа уже могло не быть.
-    entry_price = current_price
+    # Реальный вход — по факту исполнения, зажатый в границы зоны входа
+    # (fill_price из find_live_entry): если тик уже успел уйти за пределы
+    # зоны к моменту опроса (мы поймали касание по recent_high/low), сайзинг
+    # и TP считаем от границы зоны, а не от цены, которой там уже нет. SL
+    # остаётся на структурном уровне (там сетап реально инвалидируется).
+    entry_price = fill_price
     sl_price = setup.sl_price
     risk_per_unit = abs(entry_price - sl_price)
 
