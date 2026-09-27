@@ -181,16 +181,31 @@ def find_live_entry(setups, current_price: float, last_bar_index: int,
     (зажатой в границы зоны, если тик уже успел уйти дальше) до SL, ширина
     зоны входа ограничена долей от этого риска (MAX_ZONE_TO_RISK_FRAC) —
     иначе фактический филл может оказаться намного ближе к стопу, чем думает
-    сайзинг позиции."""
+    сайзинг позиции.
+
+    Возвращает (setup_или_None, fill_price_или_None, funnel) — funnel считает,
+    сколько сетапов срезалось на КАЖДОМ этапе, чтобы при no_signal можно было
+    сразу сказать, какой именно фильтр всё режет, а не гадать вслепую."""
     hi_bound = recent_high if recent_high is not None else current_price
     lo_bound = recent_low if recent_low is not None else current_price
 
+    funnel = {
+        "total": len(setups),
+        "rejected_lookback": 0,
+        "rejected_zone_overlap": 0,
+        "rejected_zero_risk": 0,
+        "rejected_min_sl_distance": 0,
+        "rejected_zone_width": 0,
+    }
+
     for s in sorted(setups, key=lambda s: s.formed_index, reverse=True):
         if last_bar_index - s.formed_index > ENTRY_LOOKBACK_BARS:
+            funnel["rejected_lookback"] += 1
             continue
         lo, hi = sorted([s.entry_zone_bottom, s.entry_zone_top])
         # пересечение [lo_bound, hi_bound] (недавний диапазон цены) с [lo, hi] (зона входа)
         if hi_bound < lo or lo_bound > hi:
+            funnel["rejected_zone_overlap"] += 1
             continue
         # цена филла: текущий тик, зажатый в границы зоны — если тик уже вышел
         # за пределы зоны (а мы поймали её только по recent_high/low), считаем
@@ -198,15 +213,18 @@ def find_live_entry(setups, current_price: float, last_bar_index: int,
         fill_price = min(max(current_price, lo), hi)
         risk_to_sl = abs(fill_price - s.sl_price)
         if risk_to_sl <= 0:
+            funnel["rejected_zero_risk"] += 1
             continue
         risk_pct = risk_to_sl / fill_price * 100.0
         if risk_pct < MIN_SL_DISTANCE_PCT:
+            funnel["rejected_min_sl_distance"] += 1
             continue  # стоп слишком узкий (шум)
         zone_width = hi - lo
         if zone_width > risk_to_sl * MAX_ZONE_TO_RISK_FRAC:
+            funnel["rejected_zone_width"] += 1
             continue  # зона входа слишком широкая относительно дистанции до стопа
-        return s, fill_price
-    return None, None
+        return s, fill_price, funnel
+    return None, None, funnel
 
 
 def process_job(job: dict, state, current_price: float, base_cfg: ec.Config, context_cache: dict) -> dict:
@@ -276,13 +294,13 @@ def process_job(job: dict, state, current_price: float, base_cfg: ec.Config, con
     recent_high = max(recent_slice["high"].max(), current_price)
     recent_low = min(recent_slice["low"].min(), current_price)
 
-    setup, fill_price = find_live_entry(setups, current_price, last_idx, recent_high, recent_low)
+    setup, fill_price, funnel = find_live_entry(setups, current_price, last_idx, recent_high, recent_low)
 
     if not setup:
-        # диагностика: сколько сетапов вообще нашла стратегия (даже если ни
-        # один не прошел проверку зоны/риска) — чтобы не гадать вслепую,
-        # "стратегия ничего не находит" это или "находит, но фильтр режет"
-        return {"status": "no_signal", "symbol": symbol, "setups_found": len(setups)}
+        # диагностика: воронка по этапам фильтрации — на каком именно шаге
+        # срезались сетапы (а не просто "0 из N прошло"), чтобы точечно
+        # ослаблять конкретный порог вместо гадания по всем трём разом
+        return {"status": "no_signal", "symbol": symbol, "setups_found": len(setups), "funnel": funnel}
 
     # Реальный вход — по факту исполнения, зажатый в границы зоны входа
     # (fill_price из find_live_entry): если тик уже успел уйти за пределы
