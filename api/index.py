@@ -161,7 +161,9 @@ def check_open_position(state: dict, current_price: float, cfg: ec.Config):
 # исполниться, шире, чем доля от дистанции до SL, реальная цена филла может
 # оказаться намного ближе к стопу, чем думает сайзинг позиции — отсюда
 # мгновенные SL через 2-10 минут после входа при формально нормальном RR.
-MAX_ZONE_TO_RISK_FRAC = float(os.environ.get("MAX_ZONE_TO_RISK_FRAC", "0.3"))
+# 0 = фильтр выключен. ВАЖНО: для FVG/QM стоп стоит на границе зоны, поэтому
+# риск от цены филла всегда <= ширины зоны, и любой frac < 1 режет 100% сетапов.
+MAX_ZONE_TO_RISK_FRAC = float(os.environ.get("MAX_ZONE_TO_RISK_FRAC", "0"))
 
 
 # Сколько последних (закрытых) баров ТФ сетапа учитывать как "недавний диапазон
@@ -220,7 +222,7 @@ def find_live_entry(setups, current_price: float, last_bar_index: int,
             funnel["rejected_min_sl_distance"] += 1
             continue  # стоп слишком узкий (шум)
         zone_width = hi - lo
-        if zone_width > risk_to_sl * MAX_ZONE_TO_RISK_FRAC:
+        if MAX_ZONE_TO_RISK_FRAC > 0 and zone_width > risk_to_sl * MAX_ZONE_TO_RISK_FRAC:
             funnel["rejected_zone_width"] += 1
             continue  # зона входа слишком широкая относительно дистанции до стопа
         return s, fill_price, funnel
